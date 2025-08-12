@@ -1,0 +1,113 @@
+```python
+import kwant
+from matplotlib import pyplot as plt
+import numpy as np
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import scipy.ndimage
+from kwant.kpm import SpectralDensity
+from scipy.interpolate import interp1d
+import matplotlib.ticker as ticker
+
+pi = np.pi
+energies = [0.01 * i for i in range(800)]
+
+def Make_System(a, t, W, L, wd, B, rng=None, lat=None, disorder=True, correlation_length=None):
+    """Build a finite tight-binding system with optional correlated disorder."""
+    if disorder:
+        if rng is None:
+            rng = np.random.default_rng()
+        if correlation_length is not None:
+            # Gaussian-filtered correlated disorder
+            raw_noise = rng.normal(loc=0.0, scale=1.0, size=(L, W))
+            corr_noise = scipy.ndimage.gaussian_filter(raw_noise, sigma=correlation_length, mode='reflect')
+            corr_noise -= corr_noise.min()
+            corr_noise /= corr_noise.ptp()
+            corr_noise -= 0.5
+        else:
+            # Uniform uncorrelated disorder
+            corr_noise = rng.uniform(low=-1, high=1, size=(L, W))
+    if lat is None:
+        lat = kwant.lattice.square(a, norbs=1)
+    syst = kwant.Builder()
+    for x in range(L):
+        for y in range(W):
+            onsite = 4 * t + wd * corr_noise[x, y] if disorder else 4 * t
+            syst[lat(x, y)] = onsite
+    syst[lat.neighbors()] = Make_Hopping(t, W, B)
+    return syst
+
+def Make_Hopping(t, W, B):
+    """Return hopping function with Peierls phase for magnetic field in Landau gauge."""
+    def Hopping(site1, site2):
+        x1, y1 = site1.pos
+        x2, y2 = site2.pos
+        dy = y2 - y1
+        if y1 == y2:
+            return -t  # Hopping in x-direction
+        elif x1 == x2:
+            if (y1 == 0 and y2 == W-1) or (y1 == W-1 and y2 == 0):
+                return -t  # Periodic boundary in y
+            else:
+                phase = np.exp(1j * B * x1 * dy)
+                return -t * phase
+        return 0
+    return Hopping
+
+def compute_dos(system, num_moments=2000):
+    """Compute DOS and integrated DOS using KPM."""
+    rho = SpectralDensity(system, num_vectors=100, num_moments=num_moments)
+    return rho.energies, rho.densities, rho.integrate()
+
+def Single_Real_No_Leads(a, t, W, L, wd, B, rng, lat, disorder=True, correlation_length=None):
+    """Single realization without leads for DOS calculation."""
+    syst = Make_System(a, t, W, L, wd, B, disorder=disorder, rng=rng, lat=lat, correlation_length=correlation_length).finalized()
+    return compute_dos(syst)
+
+def Single_Reals(a, t, W, L, wd, B, seed, disorder=True, correlation_length=None):
+    """Compute DOS and cumulative states for one random seed."""
+    rng = np.random.default_rng(seed)
+    lat = kwant.lattice.square(a, norbs=1)
+    dos_energies, dos_values, cumulative_states = Single_Real_No_Leads(a, t, W, L, wd, B, rng, lat, disorder, correlation_length)
+    energy_diff = np.diff(dos_energies, prepend=dos_energies[0])
+    cumulative_states = np.cumsum(dos_values * energy_diff)
+    return dos_energies, dos_values, cumulative_states
+
+def Reals(a, t, W, L, wd, B, n, disorder=True, correlation_length=None):
+    """Average DOS over multiple realizations and compute filling factor."""
+    A = L * W
+    all_dos_vals, all_cumulative_states, all_energies_kpm = [], [], []
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(Single_Reals, a, t, W, L, wd, B, i, disorder, correlation_length) for i in range(n)]
+        with tqdm(total=n, desc="Averaging DOS") as pbar:
+            for future in as_completed(futures):
+                dos_e, dos_vals, cumulative_states = future.result()
+                all_dos_vals.append(dos_vals)
+                all_cumulative_states.append(cumulative_states)
+                all_energies_kpm.append(dos_e)
+                pbar.update(1)
+    avg_dos = np.mean(all_dos_vals, axis=0)
+    avg_cumulative_states = np.mean(all_cumulative_states, axis=0)
+    avg_energies_kpm = np.mean(all_energies_kpm, axis=0)
+    N_phi = B * A / (2 * np.pi)
+    filling = avg_cumulative_states / N_phi
+    plt.figure()
+    plt.plot(avg_energies_kpm, avg_dos, label="Density of States (DOS)")
+    plt.xlabel("Energy [t]")
+    plt.ylabel("Density of States")
+    plt.legend(); plt.grid(True)
+    plt.title("Density of States (DOS)")
+    plt.gca().xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    plt.show()
+    plt.figure()
+    plt.plot(avg_energies_kpm, filling)
+    plt.xlabel("KPM Energy")
+    plt.ylabel(r"Filling Factor $\\nu$ (LL units)")
+    plt.title("Corrected DoS-based Filling Factor vs KPM Energy")
+    plt.grid(True)
+    plt.gca().xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    plt.show()
+    return filling, avg_energies_kpm
+```
