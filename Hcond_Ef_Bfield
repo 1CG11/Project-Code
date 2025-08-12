@@ -1,0 +1,250 @@
+import kwant
+from matplotlib import pyplot as plt
+import numpy as np
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import scipy.ndimage
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
+# Global list of energies for which scattering calculations will be performed
+# The energies will be from 0.01 to 7.99 (800 values in total)
+energies = [0.01 * i for i in range(800)]
+
+# ------------------------- Utilities & Builders -------------------------
+def Make_Hopping(t, W, B):
+    """
+    This function generates the hopping term between sites in the system
+    considering magnetic field effects, especially hopping in the y-direction.
+    Args:
+        t (float): hopping strength.
+        W (int): width of the system.
+        B (float): magnetic field strength (used for phase factor).
+    Returns:
+        function: hopping term based on the site positions and B.
+    """
+    def Hopping(site1, site2):
+        x1, y1 = site1.pos
+        x2, y2 = site2.pos
+        dy = y2 - y1
+        
+        # Hopping in the x-direction (standard tight-binding model)
+        if y1 == y2:
+            return -t
+        
+        # Hopping in the y-direction with a phase factor due to magnetic field
+        elif x1 == x2:
+            if y1 == 0 and y2 == W-1:  # Bottom to top (periodicity)
+                return -t
+            elif y1 == W-1 and y2 == 0:  # Top to bottom (periodicity)
+                return -t
+            else:
+                # Phase factor accounting for magnetic field B and hopping in y-direction
+                phase = np.exp(1j * B * x1 * dy)
+                return -t * phase
+        return 0
+
+    return Hopping
+
+def Left_Lead_Builder(lat, a, t, W):
+    """Builds a left lead (source) with translational symmetry along -x."""
+    lead = kwant.Builder(kwant.TranslationalSymmetry((-a, 0)))  # Translational symmetry in x-direction
+    lead[(lat(0, j) for j in range(W))] = 4 * t  # On-site energy for the lead
+    lead[lat.neighbors()] = -t  # Hopping terms between neighboring sites in the lead
+    return lead
+
+def Hall_Lead_Builder(lat, a, t, W, L):
+    """
+    Builds the Hall leads (top and bottom):
+    - Bottom: translational symmetry along -y.
+    - Top: translational symmetry along +y.
+    Args:
+        lat (kwant.lattice): lattice definition.
+        a (float): lattice spacing.
+        t (float): hopping strength.
+        W (int): width of the system.
+        L (int): length of the system.
+    Returns:
+        tuple: bottom and top Hall leads.
+    """
+    # Bottom Hall lead
+    Hall_lead = kwant.Builder(kwant.TranslationalSymmetry((0, -a)))
+    Hall_lead[(lat(i, 0) for i in range(L))] = 4 * t
+    Hall_lead[lat.neighbors()] = -t
+
+    # Top Hall lead
+    Hall_lead_reversed = kwant.Builder(kwant.TranslationalSymmetry((0, a)))
+    Hall_lead_reversed[(lat(i, W - 1) for i in range(L))] = 4 * t
+    Hall_lead_reversed[lat.neighbors()] = -t
+    # Ensure connection between top row and second-to-top row
+    Hall_lead_reversed[((lat(i, W - 1), lat(i, W - 2)) for i in range(L))] = -t
+
+    return Hall_lead, Hall_lead_reversed
+
+# ------------------------- System builder (Hall-only) -------------------------
+def Make_System(a, t, W, L, wd, B, rng=None, lat=None, disorder=True, Attach=True,
+                left_lead=None, Hall_lead=None, Hall_lead_reversed=None, correlation_length=None):
+    """
+    Constructs a rectangular LxW scattering region with optional disorder and magnetic field.
+    Optionally, attaches leads for transport calculations.
+    """
+    # Generate disorder potential if specified
+    if disorder:
+        if rng is None:
+            rng = np.random.default_rng()
+        if correlation_length is not None:
+            # Correlated Gaussian disorder
+            raw_noise = rng.normal(loc=0.0, scale=1.0, size=(L, W))
+            corr_noise = scipy.ndimage.gaussian_filter(raw_noise, sigma=correlation_length, mode='reflect')
+            corr_noise -= corr_noise.min()
+            corr_noise /= corr_noise.ptp()  # Normalize
+            corr_noise = corr_noise - 0.5  # Center around 0
+        else:
+            # Uncorrelated uniform disorder
+            corr_noise = rng.uniform(low=-0.5, high=0.5, size=(L, W))
+
+    # If no lattice is given, use square lattice
+    if lat is None:
+        lat = kwant.lattice.square(a, norbs=1)
+
+    if Attach:
+        # Build leads if not provided
+        if Hall_lead is None or Hall_lead_reversed is None:
+            Hall_lead, Hall_lead_reversed = Hall_Lead_Builder(lat, a, t, W, L)
+        if left_lead is None:
+            left_lead = Left_Lead_Builder(lat, a, t, W)
+
+    # Create scattering region with disorder and hopping terms
+    syst = kwant.Builder()
+
+    # Add sites with disorder
+    for x in range(L):
+        for y in range(W):
+            if disorder:
+                onsite = 4 * t + wd * corr_noise[x, y]  # Add disorder term
+            else:
+                onsite = 4 * t  # No disorder
+            syst[lat(x, y)] = onsite
+
+    # Add hopping terms considering the magnetic field
+    syst[lat.neighbors()] = Make_Hopping(t, W, B)
+
+    if Attach:
+        # Attach leads
+        syst.attach_lead(left_lead)
+        syst.attach_lead(Hall_lead)
+        syst.attach_lead(Hall_lead_reversed)
+
+    return syst
+
+# ------------------------- Single-realization Hall measurement -------------------------
+def Single_Real_Hall(a, t, W, L, wd, B, seed, disorder=True, correlation_length=None):
+    """
+    Runs a single disorder realization:
+    1. Build system with leads.
+    2. Calculate Hall conductance at all energies.
+    """
+    # Generate random number generator with seed
+    rng = np.random.default_rng(seed)
+    lat = kwant.lattice.square(a, norbs=1)
+
+    # Build Hall leads and left lead
+    Hall_lead, Hall_lead_reversed = Hall_Lead_Builder(lat, a, t, W, L)
+    left_lead = Left_Lead_Builder(lat, a, t, W)
+
+    # Create system with disorder and leads attached
+    syst = Make_System(a, t, W, L, wd, B, rng=rng, lat=lat, disorder=disorder,
+                       Attach=True, left_lead=left_lead,
+                       Hall_lead=Hall_lead, Hall_lead_reversed=Hall_lead_reversed,
+                       correlation_length=correlation_length)
+
+    syst = syst.finalized()
+
+    hall = []
+    # Compute Hall conductance for each energy
+    for energy in energies:
+        smatrix = kwant.smatrix(syst, energy)
+        hall_val = smatrix.transmission(2, 0) - smatrix.transmission(1, 0)  # Hall conductance
+        hall.append(hall_val)
+
+    return hall
+
+# ------------------------- Averaging over realizations -------------------------
+def Reals(a, t, W, L, wd, B, n, disorder=True, correlation_length=None, Show_plots=True):
+    """
+    Compute averaged Hall conductance over n disorder realizations in parallel.
+    Returns: energies and averaged Hall conductance.
+    """
+    total_hall = np.zeros(len(energies))  # Initialize the array for storing averaged Hall conductance
+
+    # Parallel execution of disorder realizations
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(Single_Real_Hall, a, t, W, L, wd, B, i, disorder, correlation_length) for i in range(n)]
+        with tqdm(total=n, desc="Averaging Hall conductance") as pbar:
+            for future in as_completed(futures):
+                hall = future.result()  # Get Hall conductance for the current realization
+                total_hall += np.array(hall)  # Sum the Hall conductance over all realizations
+                pbar.update(1)
+
+    avg_hall = total_hall / n  # Compute the average Hall conductance
+
+    if Show_plots:
+        # Plot the averaged Hall conductance vs energy
+        plt.figure()
+        plt.plot(energies, avg_hall, label="Hall Conductance")
+        plt.xlabel("Energy [t]")
+        plt.ylabel("Hall Conductance [e^2/h]")
+        plt.title("Averaged Hall Conductance vs Energy")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    return energies, avg_hall
+
+# ------------------------- Convenience plotting over B values -------------------------
+def plot_cond_vs_Magstrength(B_values, a, t, W, L, wd, n, disorder=True, correlation_length=None):
+    """
+    Plot Hall conductance vs energy for multiple magnetic field values.
+    Each curve corresponds to a different B.
+    """
+    avg_hall_list = []
+    energies_list = []
+
+    norm = mcolors.Normalize(vmin=min(B_values), vmax=max(B_values))
+    cmap = cm.viridis  # Use the 'viridis' colormap
+
+    # Compute for each B value
+    for B in B_values:
+        engs, avg_hall = Reals(a, t, W, L, wd, B, n, disorder, correlation_length, Show_plots=False)
+        avg_hall_list.append(avg_hall)
+        energies_list.append(engs)
+
+    # Plot all curves with color coding by B value
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, B in enumerate(B_values):
+        color = cmap(norm(B))
+        ax.plot(energies_list[i], avg_hall_list[i], label=f"B = {B:.2f}", color=color)
+
+    # Add color bar for magnetic field strength
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax)
+    cbar.set_label('Magnetic Field Strength (B)')
+    plt.xlim(0, 3)
+    plt.ylim(0, 4)
+    ax.set_xlabel("Energy [t]")
+    ax.set_ylabel("Hall Conductance $G_{xy}$ [e²/h]")
+    ax.set_title("Hall Conductance vs Energy for Varying Magnetic Field Strength")
+    ax.grid(True)
+
+    plt.show()
+
+    # Recursive call seems unintended; likely a bug if kept
+    plot_cond_vs_Magstrength(B_values, a, t, W, L, wd, n)  # This could cause an infinite recursion
+
+# ------------------------- Example usage -------------------------
+if __name__ == '__main__':
+    # Small example parameters (adjust to taste)
+    B_values = (0.5, 1.0, 1.5, 2)
+    a, t, W, L, wd, n = 1, 1, 20, 20, 1, 20  # smaller n for a quick test
+    plot_cond_vs_Magstrength(B_values, a, t, W, L, wd, n)  # Run the plotting function
