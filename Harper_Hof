@@ -1,0 +1,90 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import eigvalsh
+from tqdm import tqdm
+
+# --- Parameters ---
+n_ky_vals = 10  # Number of k_y values to sample over
+q = 400  # Matrix size (for better resolution)
+phi_vals = np.linspace(0, 1, 400)  # 400 flux values
+
+# Prepare to sample over k_y, including k_y=0
+ky_vals = np.linspace(-np.pi, np.pi, n_ky_vals)  # k_y values sampled from -pi to pi
+ky_vals = np.insert(ky_vals, 0, 0)  # Insert k_y = 0
+
+# Prepare to store energies
+energies_dict = {k_y: [] for k_y in ky_vals}
+
+# Loop over phi values and k_y values
+for k_y in tqdm(ky_vals, desc="k_y values"):
+    for phi in phi_vals:
+        for phi in phi_vals:
+            # Construct diagonal and off-diagonal terms
+            x = np.arange(q)
+            diag = 2 * np.cos(2 * np.pi * phi * x + k_y)  # Diagonal includes k_y term
+            off_diag = np.ones(q - 1)  # Off-diagonal elements (one less than diagonal)
+        
+            # --- Explicit Matrix Construction ---
+            H = np.zeros((q, q))  # Start with a zero matrix
+            # Fill diagonal and off-diagonal elements
+            np.fill_diagonal(H, diag)  # Diagonal elements (with k_y)
+            
+            for i in range(q - 1):
+                # Upper diagonal (with periodicity in the x-direction)
+                H[i, i + 1] = off_diag[i]
+                # Lower diagonal
+                H[i + 1, i] = off_diag[i]
+                # Connect last to first in the x-direction
+                H[q-1, 0] = off_diag[q-2]
+                H[0, q-1] = off_diag[q-2]
+            
+            # For periodicity in the y-direction (bottom to top)
+            # Apply the phase factor due to the magnetic flux for hopping between bottom and top row
+            phase = np.exp(1j * 2 * np.pi * phi)  # Phase for magnetic flux
+            H[q-1, 0] = off_diag[q-2] * phase  # Bottom to top
+            H[0, q-1] = off_diag[q-2] * phase  # Top to bottom
+        
+            # Check matrix dimensions before eigenvalue calculation
+            print(f"Matrix dimensions (k_y={k_y}, phi={phi}): {H.shape}")
+        
+            # Ensure the matrix is square (which it should be)
+            if H.shape[0] == H.shape[1]:
+                try:
+                    eigvals = eigvalsh(H)  # Using eigvalsh for symmetric matrices
+                    energies_dict[k_y].append(eigvals)
+                except Exception as e:
+                    print(f"Error computing eigenvalues for k_y={k_y}, phi={phi}: {e}")
+            else:
+                print(f"Matrix is not square for k_y={k_y}, phi={phi}")
+
+# --- Plotting ---
+# Plot individual Hofstadter butterflies for each k_y
+for k_y, energies in energies_dict.items():
+    plt.figure(figsize=(10, 6))
+    for i, eig in enumerate(energies):
+        if len(eig) > 0:
+            plt.plot([phi_vals[i]] * len(eig), eig, 'k.', markersize=0.5)
+
+    plt.xlabel(r"$\phi/\phi_0$ (Flux Quantum per Plaquette)")
+    plt.ylabel("Energy")
+    plt.title(f"Hofstadter Butterfly (k_y={k_y:.2f})")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# --- Super Plot 1 ---
+# Combine all k_y plots into a single figure for a super plot with distinct colors for each k_y
+plt.figure(figsize=(12, 8))
+for i, k_y in enumerate(ky_vals):
+    energies = energies_dict[k_y]
+    for j, eig in enumerate(energies):
+        if len(eig) > 0:
+            plt.plot([phi_vals[j]] * len(eig), eig, '.', markersize=0.5, alpha=0.5)
+
+plt.xlabel(r"$\phi/\phi_0$ (Flux Quantum per Plaquette)")
+plt.ylabel("Energy")
+plt.title("Hofstadter Butterfly (All k_y values)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
