@@ -1,0 +1,287 @@
+import kwant
+from matplotlib import pyplot as plt
+import numpy as np
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import scipy.ndimage
+from kwant.kpm import SpectralDensity
+from scipy.interpolate import interp1d
+import matplotlib.animation as animation
+
+# Define the energy range for transport calculations
+# 800 evenly spaced energies from 0 to 8*t with step 0.01
+energies = [0.01 * i for i in range(800)]
+
+def Make_System(a, t, W, L, wd, B, rng=None, lat=None, disorder=True, Attach=True,
+                lead=None, lead_reversed=None, Hall_lead=None, Hall_lead_reversed=None,
+                correlation_length=None):
+    """
+    Build a rectangular 2D tight-binding system in Kwant with optional disorder and leads.
+    This function can:
+    - Generate correlated or uncorrelated disorder potentials.
+    - Attach both longitudinal and Hall leads.
+    - Allow lead objects to be passed in externally to avoid rebuilding.
+    """
+    # Generate disorder potential if requested
+    if disorder:
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if correlation_length is not None:
+            # Correlated disorder via Gaussian filter on white noise
+            raw_noise = rng.normal(loc=0.0, scale=1.0, size=(L, W))
+            corr_noise = scipy.ndimage.gaussian_filter(raw_noise, sigma=correlation_length, mode='reflect') 
+            # Normalize to [-0.5, 0.5]
+            corr_noise -= corr_noise.min()
+            corr_noise /= corr_noise.ptp()
+            corr_noise = corr_noise - 0.5
+        else:
+            # Uncorrelated disorder in [-1, 1]
+            corr_noise = rng.uniform(low=-1, high=1, size=(L, W))
+
+    # If no lattice object is passed, create one
+    if lat is None:
+        lat = kwant.lattice.square(a, norbs=1)
+        if Attach:
+            # Build Hall leads if not provided
+            if Hall_lead is None or Hall_lead_reversed is None:
+                Hall_lead, Hall_lead_reversed = Hall_Lead_Builder(lat, a, t, W, L, wd, B)
+            # Build longitudinal leads if not provided
+            if lead is None or lead_reversed is None:
+                lead, lead_reversed = Classic_Lead_Builder(lat, a, t, W, wd, B)
+
+    # Safety check — leads must be defined before attaching
+    if Attach:
+        if lead is None or lead_reversed is None:
+            raise ValueError("Leads are not properly defined. Please check the lead creation.")
+        if Hall_lead is None or Hall_lead_reversed is None:
+            raise ValueError("Hall leads are not properly defined. Please check Hall lead creation.")
+
+    # Initialize system builder
+    syst = kwant.Builder()
+
+    # Onsite term: 4*t + disorder shift
+    for x in range(L):
+        for y in range(W):
+            if disorder:
+                onsite = 4 * t + wd * corr_noise[x, y]
+            else:
+                onsite = 4 * t
+            syst[lat(x, y)] = onsite
+    
+    # Nearest-neighbor hopping
+    syst[lat.neighbors()] = Make_Hopping(t, W, B)
+  
+    # Attach leads if requested
+    if Attach:
+        syst.attach_lead(lead)
+        syst.attach_lead(lead_reversed)
+        syst.attach_lead(Hall_lead)
+        syst.attach_lead(Hall_lead_reversed)
+
+    return syst
+
+def Classic_Lead_Builder(lat, a, t, W, wd, B):
+    """Build left/right leads for longitudinal conductance measurement."""
+    lead = kwant.Builder(kwant.TranslationalSymmetry((-a, 0)))
+    lead[(lat(0, j) for j in range(W))] = 4 * t
+    lead[lat.neighbors()] = -t
+
+    lead_reversed = kwant.Builder(kwant.TranslationalSymmetry((a, 0)))
+    lead_reversed[(lat(0, j) for j in range(W))] = 4 * t
+    lead_reversed[lat.neighbors()] = -t
+    lead_reversed[((lat(0, j), lat(1, j)) for j in range(W))] = -t
+
+    return lead, lead_reversed
+
+def Hall_Lead_Builder(lat, a, t, W, L, wd, B):
+    """Build top/bottom leads for Hall conductance measurement."""
+    Hall_lead = kwant.Builder(kwant.TranslationalSymmetry((0, -a)))
+    Hall_lead[(lat(i, 0) for i in range(L))] = 4 * t
+    Hall_lead[lat.neighbors()] = -t
+
+    Hall_lead_reversed = kwant.Builder(kwant.TranslationalSymmetry((0, a)))
+    Hall_lead_reversed[(lat(i, W - 1) for i in range(L))] = 4 * t
+    Hall_lead_reversed[lat.neighbors()] = -t
+    Hall_lead_reversed[((lat(i, W - 1), lat(i, W - 2)) for i in range(L))] = -t
+
+    return Hall_lead, Hall_lead_reversed
+
+def Make_Hopping(t, W, B):
+    """Return hopping function that includes Peierls phase for magnetic field in y-direction."""
+    def Hopping(site1, site2):
+        x1, y1 = site1.pos
+        x2, y2 = site2.pos
+        dy = y2 - y1
+        
+        # Hopping along x — normal tight-binding
+        if y1 == y2:
+            return -t
+        # Hopping along y — possibly include magnetic phase
+        elif x1 == x2:
+            if y1 == 0 and y2 == W-1:  # periodic BC: top to bottom
+                return -t
+            elif y1 == W-1 and y2 == 0:  # periodic BC: bottom to top
+                return -t
+            else:
+                # Peierls phase proportional to magnetic flux
+                phase = np.exp(1j * B * x1 * dy)
+                return -t * phase
+        return 0
+
+    return Hopping
+
+def compute_dos(system, num_moments=1000):
+    """Compute density of states via Kernel Polynomial Method (KPM)."""
+    rho = SpectralDensity(system, num_moments=num_moments)
+    dos_values = rho.densities
+    energies_kpm = rho.energies
+    return energies_kpm, dos_values
+
+def Single_Real_No_Leads(a, t, W, L, wd, B, rng, lat, disorder=True, correlation_length=None):
+    """Simulate one disorder realization without leads for DoS calculation."""
+    syst = Make_System(a, t, W, L, wd, B, disorder=disorder, rng=rng, lat=lat,
+                       Attach=False, correlation_length=correlation_length)
+    syst = syst.finalized()
+    dos_energies, dos_values = compute_dos(syst)
+    return (dos_energies, dos_values)
+
+def Single_Real_Leads(a, t, W, L, wd, B, rng, lat, disorder=True, correlation_length=None):
+    """Simulate one disorder realization with leads for conductance calculations."""
+    Hall_lead, Hall_lead_reversed = Hall_Lead_Builder(lat, a, t, W, L, wd, B)
+    lead, lead_reversed = Classic_Lead_Builder(lat, a, t, W, wd, B)
+    syst = Make_System(a, t, W, L, wd, B, disorder=disorder, rng=rng, lat=lat,
+                       lead=lead, lead_reversed=lead_reversed,
+                       Hall_lead=Hall_lead, Hall_lead_reversed=Hall_lead_reversed,
+                       correlation_length=correlation_length)
+    syst = syst.finalized()
+
+    classic = []  # longitudinal conductance
+    hall = []     # Hall conductance
+
+    for energy in energies:
+        smatrix = kwant.smatrix(syst, energy)
+        classic.append(smatrix.transmission(1, 0))
+        hall.append(smatrix.transmission(3, 0) - smatrix.transmission(2, 0))
+
+    return classic, hall
+
+def validate_dos_integral(energies_kpm, avg_dos, expected_area):
+    """Check that the integral of the DoS matches expected normalization."""
+    area = np.trapz(avg_dos, energies_kpm)
+    print(f"DoS integral = {area:.4f}")
+    if not np.isclose(area, expected_area, rtol=1e-2):
+        raise ValueError(f"⚠️ DoS integral mismatch — expected {expected_area:.4f}, got {area:.4f}")
+    else:
+        print("✅ DoS normalization validated.")
+
+def Single_Reals(a, t, W, L, wd, B, seed, disorder=True, correlation_length=None):
+    """Run both DoS and conductance calculations for one disorder realization."""
+    rng = np.random.default_rng(seed)
+    lat = kwant.lattice.square(a, norbs=1)
+    dos_energies, dos_values = Single_Real_No_Leads(a, t, W, L, wd, B, rng, lat, disorder, correlation_length)
+    classic, hall = Single_Real_Leads(a, t, W, L, wd, B, rng, lat, disorder, correlation_length)
+    return classic, hall, (dos_energies, dos_values)
+
+def Reals(a, t, W, L, wd, B, n, disorder=True, correlation_length=None):
+    """Run simulations for n disorder realizations and average results."""
+    total_classic = np.zeros(len(energies))
+    total_hall = np.zeros(len(energies))
+    total_dos = None
+    energies_kpm = None
+    A = L * W
+    all_dos_vals = []
+    all_energies_kpm = []
+
+    # Parallel loop over realizations
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(Single_Reals, a, t, W, L, wd, B, i, disorder, correlation_length) for i in range(n)]
+        with tqdm(total=n, desc="Averaging conductances") as pbar:
+            for future in as_completed(futures):
+                classic, hall, dos_pair = future.result()
+                total_classic += np.array(classic)
+                total_hall += np.array(hall)
+                dos_e, dos_vals = dos_pair
+                if total_dos is None:
+                    energies_kpm = dos_e
+                    all_dos_vals.append(dos_vals)
+                    all_energies_kpm.append(energies_kpm)
+                else:
+                    total_dos += dos_vals
+                pbar.update(1)
+
+    avg_classic = total_classic / n
+    avg_hall = total_hall / n
+    avg_dos = np.mean(all_dos_vals, axis=0)
+    avg_energies_kpm = np.mean(all_energies_kpm, axis=0)
+
+    # Filling factor from integrated DoS
+    N_phi = B * A / (2 * np.pi)
+    cumulative_states = np.cumsum(avg_dos * np.diff(energies_kpm, prepend=avg_energies_kpm[0]))
+    filling = cumulative_states / N_phi
+
+    # DoS plot
+    plt.figure()
+    plt.plot(energies_kpm, avg_dos, label="Density of States (DOS)")
+    plt.xlabel("Energy [t]")
+    plt.ylabel("Density of States")
+    plt.legend()
+    plt.grid(True)
+    plt.title("Density of States (DOS)")
+    plt.show()
+
+    # Filling factor plot
+    plt.figure()
+    plt.plot(energies_kpm, filling)
+    plt.xlabel("KPM Energy")
+    plt.ylabel("Filling Factor $\\nu$ (LL units)")
+    plt.title("Corrected DoS-based Filling Factor vs KPM Energy")
+    plt.grid(True)
+    plt.show()
+
+    # Longitudinal conductance plot
+    plt.figure()
+    plt.plot(energies, avg_classic, label="Classic Conductance")
+    plt.xlabel("Energy [t]")
+    plt.ylabel("Conductance [e^2/h]")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    # Hall conductance plot
+    plt.figure()
+    plt.plot(energies, avg_hall, label="Hall Conductance")
+    plt.xlabel("Energy [t]")
+    plt.ylabel("Hall Conductance [e^2/h]")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Interpolations for plotting vs filling factor
+    interp_classic = interp1d(energies, avg_classic, bounds_error=False, fill_value="extrapolate")
+    interp_hall = interp1d(energies, avg_hall, bounds_error=False, fill_value="extrapolate")
+    classic_vs_fill = interp_classic(energies_kpm)
+    hall_vs_fill = interp_hall(energies_kpm)
+
+    # Hall conductance vs filling factor
+    plt.figure()
+    plt.plot(filling, hall_vs_fill, label="Hall Conductance vs Filling")
+    plt.xlabel("Filling Factor $\\nu$")
+    plt.ylabel("Hall Conductance [e^2/h]")
+    plt.title("Hall Conductance vs Filling Factor")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+    # Longitudinal conductance vs filling factor
+    plt.figure()
+    plt.plot(filling, classic_vs_fill, label="Longitudinal Conductance vs Filling")
+    plt.xlabel("Filling Factor $\\nu$")
+    plt.ylabel("Longitudinal Conductance [e^2/h]")
+    plt.title("Longitudinal Conductance vs Filling Factor")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+    
+    return filling, energies_kpm, avg_classic, avg_hall
