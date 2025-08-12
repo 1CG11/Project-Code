@@ -1,0 +1,285 @@
+import kwant
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.sparse.linalg import eigsh
+from scipy.optimize import curve_fit
+import seaborn as sns
+import sys
+from kwant.plotter import current
+from kwant.operator import Current
+import scipy.sparse.linalg as sla
+
+# Threshold for identifying localized states via IPR
+THRESHOLD_IPR = 0.04
+# Maximum number of wavefunction fit plots to display
+MAX_PLOTS = 1
+
+
+def exp_decay(x, A, xi):
+    """Exponential decay model for fitting localization length."""
+    return A * np.exp(-2 * x / xi)
+
+
+def Make_Hopping(t, W, B):
+    """
+    Returns hopping function including Peierls phase and periodic BC in y-direction.
+    """
+    def Hopping(site1, site2):
+        x1, y1 = site1.pos
+        x2, y2 = site2.pos
+
+        # Periodic BC: bottom ↔ top
+        if y1 == 0 and y2 == W - 1:
+            phase = np.exp(1j * B * x1 * (y2 - y1))
+            return -t * phase
+        elif y1 == W - 1 and y2 == 0:
+            phase = np.exp(1j * B * x1 * (y2 - y1))
+            return -t * phase
+        # Horizontal hopping
+        elif y1 == y2:
+            return -t
+        # Vertical hopping with magnetic phase
+        else:
+            phase = np.exp(1j * B * x1 * (y2 - y1))
+            return -t * phase
+
+    return Hopping
+
+
+def Make_System(a, t, W, L, wd, B, disorder=True, rng=None, lat=None):
+    """
+    Builds and finalizes a W×L system with optional disorder and magnetic field B.
+    """
+    if lat is None:
+        lat = kwant.lattice.square(a, norbs=1)
+    syst = kwant.Builder()
+    for x in range(L):
+        for y in range(W):
+            if disorder:
+                if rng is None:
+                    rng = np.random.default_rng()
+                onsite = 4 * t + wd * rng.uniform(-0.5, 0.5)
+            else:
+                onsite = 4 * t
+            syst[lat(x, y)] = onsite
+    syst[lat.neighbors()] = Make_Hopping(t, W, B)
+    return syst.finalized()
+
+
+def extract_localization_length(psi, idx, plot_count, tail_fraction=0.2, show_plot=True):
+    """
+    Fit exponential decay to the highest amplitudes of |ψ|² to estimate localization length.
+    """
+    density = np.abs(psi) ** 2
+    sorted_density = np.sort(density)[::-1]
+    N = len(sorted_density)
+    tail = int(N * tail_fraction)
+    x_vals = np.arange(tail)
+    y_vals = sorted_density[:tail]
+    try:
+        popt, _ = curve_fit(exp_decay, x_vals, y_vals,
+                            p0=(1.0, N / 4),
+                            bounds=([0, 1e-2], [10, N]))
+        xi = popt[1]
+        if show_plot and plot_count < MAX_PLOTS:
+            plt.figure()
+            plt.plot(x_vals, y_vals, 'b-', label='Fit Region |ψ|²')
+            plt.plot(x_vals, exp_decay(x_vals, *popt), 'r--', label=f'Fit: ξ={xi:.2f}')
+            plt.xlabel('Sorted Site Index (Leading Amplitudes)')
+            plt.ylabel('|ψ|²')
+            plt.title(f'Localized State {idx} - Focused Exponential Fit')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+        return xi, plot_count + 1
+    except (RuntimeError, ValueError):
+        return None, plot_count
+
+
+def loc_ipr(a, t, W, L, wd, B, target_energy=None, return_vals_only=False, show_fits=True):
+    """
+    Calculate IPR for eigenstates, identify localized states, and analyze localization lengths.
+    """
+    finalized_sys = Make_System(a, t, W, L, wd, B)
+    H = finalized_sys.hamiltonian_submatrix()
+    N = H.shape[0]
+    k = N
+    eigvals, eigvecs = eigsh(H, k=k, which='LM')
+
+    iprs, loc_lengths, fitted_xis = [], [], []
+    xi_by_index, xi_by_energy = [], []
+    localized_eigvals = []
+    plot_count = 0
+
+    # Loop over eigenstates to compute IPR and fit localization length if localized
+    for i in tqdm(range(k), desc=f"L={L}", ncols=100, file=sys.stdout):
+        psi = eigvecs[:, i]
+        psi /= np.linalg.norm(psi)
+        ipr = np.sum(np.abs(psi) ** 4)
+
+        if ipr > THRESHOLD_IPR:
+            localized_eigvals.append(eigvals[i])
+            xi, plot_count = extract_localization_length(psi, i, plot_count, show_plot=show_fits)
+            if xi:
+                fitted_xis.append(xi)
+                xi_by_index.append((i, xi))
+                xi_by_energy.append((eigvals[i], xi))
+
+    if return_vals_only:
+        return eigvals, iprs
+
+    # Plot ground state wavefunction density
+    psi0 = np.abs(eigvecs[:, 0].reshape((L, W)))**2
+    plt.figure(figsize=(6, 5))
+    plt.imshow(psi0, origin='lower', cmap='viridis')
+    plt.title("Ground State |ψ|²")
+    plt.colorbar()
+    plt.show()
+
+    # Plot target energy state wavefunction if requested
+    if target_energy is not None:
+        energy_diffs = np.abs(eigvals - target_energy)
+        closest_idx = np.argmin(energy_diffs)
+        psi_target = np.abs(eigvecs[:, closest_idx].reshape((L, W))) ** 2
+        plt.figure(figsize=(6, 5))
+        plt.imshow(psi_target, origin='lower', cmap='inferno')
+        plt.title(f"State near E ≈ {target_energy:.2f} |ψ|²")
+        plt.colorbar()
+        plt.show()
+
+    print("Ground state energy:", eigvals[0])
+    print("Closest to target_energy:", eigvals[closest_idx])
+
+    # IPR vs Energy
+    plt.figure()
+    plt.plot(eigvals, iprs, '.', color='purple')
+    plt.xlabel("Energy")
+    plt.ylabel("IPR")
+    plt.title("IPR vs Energy")
+    plt.grid(True)
+    plt.show()
+
+    # IPR vs Eigenstate Index
+    plt.figure()
+    plt.plot(range(len(iprs)), iprs, '.', color='blue')
+    plt.xlabel("Eigenstate Index")
+    plt.ylabel("IPR")
+    plt.title("IPR vs Eigenstate Index")
+    plt.grid(True)
+    plt.show()
+
+    # Energy vs Eigenstate Index
+    plt.figure()
+    plt.plot(np.sort(eigvals), np.arange(len(eigvals)), '-', color='black')
+    plt.xlabel("Energy (sorted)")
+    plt.ylabel("Eigenstate Index")
+    plt.title("Energy vs Eigenstate Index")
+    plt.grid(True)
+    plt.show()
+
+    # KDE of fitted localization lengths
+    if fitted_xis:
+        plt.figure()
+        sns.kdeplot(fitted_xis, fill=True)
+        plt.xlabel('Fitted Localization Length ξ')
+        plt.ylabel('Density')
+        plt.title('Smoothed Density of Fitted Localization Lengths')
+        plt.grid(True)
+        plt.show()
+
+        indices, xis = zip(*xi_by_index)
+        plt.figure()
+        plt.plot(indices, xis, '.', label='ξ from fit')
+        plt.xlabel('Eigenstate Index')
+        plt.ylabel('Localization Length (ξ)')
+        plt.title('Localization Length (Fit) vs Eigenstate Index')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+        energies_fit, xis_fit = zip(*xi_by_energy)
+        plt.figure()
+        plt.plot(energies_fit, xis_fit, '.', color='green', label='ξ from fit')
+        plt.xlabel('Energy')
+        plt.ylabel('Localization Length (ξ)')
+        plt.title('Localization Length (Fit) vs Energy')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    # KDE of localization lengths near target energy
+    if target_energy is not None:
+        selected = [l for e, l in zip(eigvals, loc_lengths) if abs(e - target_energy) < 0.1]
+        if selected:
+            plt.figure()
+            sns.kdeplot(selected, fill=True)
+            plt.title(f"Localization Length Density near E ≈ {target_energy}")
+            plt.xlabel("Localization Length")
+            plt.ylabel("Density")
+            plt.show()
+
+    return eigvals, loc_lengths, np.mean(loc_lengths)
+
+
+def identify_edge_states(H, eigvals, eigvecs, edge_width=5, W=None, L=None):
+    """
+    Identify eigenstates whose probability density is concentrated near the sample edges.
+    """
+    edge_indices = []
+    for i in range(eigvecs.shape[1]):
+        psi = np.abs(eigvecs[:, i]) ** 2
+        psi_reshaped = psi.reshape((L, W))
+        edge_mask = np.zeros_like(psi_reshaped, dtype=bool)
+        # Mark edge regions
+        edge_mask[:edge_width, :] = 1
+        edge_mask[-edge_width:, :] = 1
+        edge_mask[:, :edge_width] = 1
+        edge_mask[:, -edge_width:] = 1
+        edge_density = np.sum(psi_reshaped[edge_mask])
+        total_density = np.sum(psi_reshaped)
+        if edge_density / total_density > 0.5:
+            edge_indices.append(i)
+    return edge_indices
+
+
+def plot_edge_states(system, eigvecs, edge_indices, L, W, max_plots=3):
+    """Visualize |ψ|² for identified edge states."""
+    for idx in edge_indices[:max_plots]:
+        psi = np.abs(eigvecs[:, idx].reshape((L, W)))**2
+        plt.figure(figsize=(6, 5))
+        plt.imshow(psi, origin='lower', cmap='plasma')
+        plt.title(f"Edge State |ψ|² - Index {idx}")
+        plt.colorbar()
+        plt.tight_layout()
+        plt.show()
+
+
+def plot_edge_currents(system, eigvecs, edge_indices, max_plots=3):
+    """Visualize current density for identified edge states."""
+    J_op = Current(system)
+    for idx in edge_indices[:max_plots]:
+        psi = eigvecs[:, idx]
+        j = J_op(psi)
+        kwant.plotter.current(system, j, colorbar=True)
+
+
+if __name__ == "__main__":
+    # Lattice and disorder parameters
+    a, t = 1, 1
+    W, L = 50, 50
+    wd, B = 0.5, 0.6
+    rng = np.random.default_rng(42)
+
+    # Build system and solve full spectrum
+    system = Make_System(a, t, W, L, wd, B, disorder=True, rng=rng)
+    H = system.hamiltonian_submatrix()
+    eigvals, eigvecs = eigsh(H, k=W*L, which='LM')
+
+    # Identify and visualize edge states
+    edge_indices = identify_edge_states(H, eigvals, eigvecs, edge_width=3, W=W, L=L)
+    print(f"Identified {len(edge_indices)} edge states")
+
+    plot_edge_states(system, eigvecs, edge_indices, L, W)
+    plot_edge_currents(system, eigvecs, edge_indices)
